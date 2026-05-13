@@ -17,7 +17,7 @@ from pkg.drivers import DisparityExtender
 drivers = [DisparityExtender()]
 
 # choose your racetrack here (Oschersleben, SOCHI, SOCHI_OBS)
-RACETRACK = 'Oschersleben'
+RACETRACK = 'map_easy3'
 
 
 def _pack_odom(obs, i):

@@ -34,8 +34,8 @@ from f110_gym.envs.dynamic_models import vehicle_dynamics_st, pid
 from f110_gym.envs.laser_models import ScanSimulator2D, check_ttc_jit, ray_cast
 from f110_gym.envs.collision_models import get_vertices, collision_multiple
 
-
-class RaceCar(object):
+# 차량 state, control, 물리 시뮬레이션, 라이다 센서 생성, 충돌 판단을 위한 class 
+class RaceCar(object): 
     """
     Base level race car class, handles the physics and laser scan of a single vehicle
 
@@ -74,7 +74,7 @@ class RaceCar(object):
         self.is_ego = is_ego
         self.time_step = time_step
         self.num_beams = num_beams
-        self.fov = fov
+        self.fov = fov # 시야각 270도
 
         # state is [x, y, steer_angle, vel, yaw_angle, yaw_rate, slip_angle]
         self.state = np.zeros((7,))
@@ -83,10 +83,10 @@ class RaceCar(object):
         self.opp_poses = None
 
         # control inputs
-        self.accel = 0.0
-        self.steer_angle_vel = 0.0
+        self.accel = 0.0 # 가속도
+        self.steer_angle_vel = 0.0 # 조향각 변화 속도
 
-        # steering delay buffer
+        # steering delay buffer - 조향 지연 모델링 
         self.steer_buffer = np.empty((0,))
         self.steer_buffer_size = 2
 
@@ -96,32 +96,35 @@ class RaceCar(object):
         # collision threshold for iTTC to environment
         self.ttc_thresh = 0.005
 
-        # initialize scan sim
+        # initialize scan sim -> 감지 가능한 최대 거리 30m
         self.scan_simulator = ScanSimulator2D(num_beams, fov, seed=self.seed)
         scan_ang_incr = self.scan_simulator.get_increment()
 
-        # current scan
+        # current scan - 라이다 거리 값 저장을 위해 
         self.current_scan = np.zeros((num_beams,))
 
         # angles of each scan beam, distance from lidar to edge of car at each beam, and precomputed cosines of each angle
+        # angle, cos(angle), 차량 외곽까지 거리 > 라이다 geometry 사전 계산
         self.cosines = np.zeros((num_beams,))
         self.scan_angles = np.zeros((num_beams,))
         self.side_distances = np.zeros((num_beams,))
 
+        # 차량 크기 기반 거리 계산 
         dist_sides = params['width'] / 2.
         dist_fr = (params['lf'] + params['lr']) / 2.
 
         for i in range(num_beams):
             angle = -fov / 2. + i * scan_ang_incr
-            self.scan_angles[i] = angle
+            self.scan_angles[i] = angle # 차량 헤딩 기준 라이다 ray가 얼마나 틀어졌는지
             self.cosines[i] = np.cos(angle)
 
+            # 왼쪽 방향
             if angle > 0:
                 if angle < np.pi / 2:
                     # between 0 and pi/2
                     to_side = dist_sides / np.sin(angle)
                     to_fr = dist_fr / np.cos(angle)
-                    self.side_distances[i] = min(to_side, to_fr)
+                    self.side_distances[i] = min(to_side, to_fr) # 라이다가 맞고 돌아온 게 차량인지 실제 장애물인지 판단하기 위해 
                 else:
                     # between pi/2 and pi
                     to_side = dist_sides / np.cos(angle - np.pi / 2.)
@@ -152,7 +155,7 @@ class RaceCar(object):
         """
         self.params = params
 
-    def set_map(self, map_path, map_ext):
+    def set_map(self, map_path, map_ext): # 라이다 시뮬레이터에 맵을 설정해주는 함수
         """
         Sets the map for scan simulator
         
@@ -208,6 +211,7 @@ class RaceCar(object):
         return new_scan
 
     def check_ttc(self):
+        # 지금 속도로 계속 가면 곧 부딪히는지 검사 -> 부딪히면 차를 즉시 멈춤
         """
         Check iTTC against the environment, sets vehicle states accordingly if collision occurs.
         Note that this does NOT check collision with other agents.
@@ -430,8 +434,10 @@ class Simulator(object):
         new_collisions, self.collision_idx = collision_multiple(all_vertices)
 
         # if collision becomes 1, it stays so until end
-        self.collisions = np.maximum(self.collisions, new_collisions)
-
+        # self.collisions = np.maximum(self.collisions, new_collisions)
+        # 승재욱 수정
+        self.collisions = new_collisions
+        
     def step(self, control_inputs):
         """
         Steps the simulation environment
