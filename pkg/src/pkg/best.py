@@ -30,7 +30,7 @@ train_start = 20000
 current_dir = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(current_dir)
 
-#RACETRACK = 'map_easy3'
+# RACETRACK = 'map_easy3'
 RACETRACK = 'Oschersleben'
 
 #JY add : parameter
@@ -202,11 +202,6 @@ def main():
     laptimes = []
 
     for n_epi in range(10000):
-        # JY fix : 학습 시작할 때부터 linear annealing 사용
-        # if memory.size() < train_start:
-        #     epsilon = 1.0
-        # else:
-        #     epsilon = max(0.01, 0.08 - 0.01 * ((n_epi - (train_start / 100)) / 200))
         epsilon = max(0.01, 0.08 - 0.01 * (n_epi / 200))  # Linear annealing from 8% to 1%
         obs, r, done, info = env.reset(poses=poses)
         # s = preprocess_lidar(obs['scans'][0]) # 약 450개 라이다 포인터 존재 -> 현재 state는 라이다 포인터만 있음
@@ -218,7 +213,7 @@ def main():
         laptime = 0.0
 
         while not done:
-            # env.render()
+            env.render()
 
             actions = []
 
@@ -232,7 +227,7 @@ def main():
                 speed = 8
             # JY add 
             # steer_abs = abs(steer)
-            # speed = 20 * np.exp(-2 * steer_abs)
+            # speed = 20 * np.exp(-3 * steer_abs)
             # speed = np.clip(speed, 4, 20)
 
             actions.append([steer, speed])
@@ -246,7 +241,7 @@ def main():
             s = s_prime
 
             laptime += r
-            # env.render(mode='human_fast')
+            env.render(mode='human_fast')
 
             if done:
                 laptimes.append(laptime)
@@ -290,7 +285,7 @@ def eval():
     speed = 3.0
     for t in range(5):
         obs, r, done, info = env.reset(poses=poses)
-        # s = preprocess_lidar(obs['scans'][0])
+        #s = preprocess_lidar(obs['scans'][0])
         s = define_state(obs) # JY add
 
         env.render()
@@ -303,28 +298,29 @@ def eval():
 
             a = q.action(torch.from_numpy(s).float())
             steer = (a - 2) * (np.pi / 30)
-            if a == 2:
-                speed = 12
+            if a == 2: # 11.23, 9.70, 6.65
+                speed = 10.9912
             elif a == 1 or a == 3:
-                speed = 10
+                speed = 12.3502
             else:
-                speed = 8
+                speed = 7.4216
+            # speed control
 
             # JY add
             # steer_abs = abs(steer)
             # speed = 20 * np.exp(-3 * steer_abs)
-            # speed = np.clip(speed, 4, 20)
+            # speed = np.clip(speed, 20, 4)
 
             actions.append([steer, speed])
             actions = np.array(actions)
             obs, r, done, info = env.step(actions)
-            # s_prime = preprocess_lidar(obs['scans'][0])
+            #s_prime = preprocess_lidar(obs['scans'][0])
             s_prime = define_state(obs) # JY add
 
             s = s_prime
 
             laptime += r
-            env.render(mode='human_fast')
+            env.render(mode='human')
 
             if done:
                 lap = round(obs['lap_times'][0], 3)

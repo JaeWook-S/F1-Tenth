@@ -30,10 +30,10 @@ train_start = 20000
 current_dir = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(current_dir)
 
-#RACETRACK = 'map_easy3'
+# RACETRACK = 'map_easy3'
 RACETRACK = 'Oschersleben'
 
-#JY add : parameter
+# JY add : parameter
 LIDAR_MIN = 0
 LIDAR_MAX = 30
 VELOCITY_MIN = -5
@@ -41,48 +41,67 @@ VELOCITY_MAX = 20
 
 def get_today():
     now = time.localtime()
-    # s = "%04d-%02d-%02d_%02d-%02d-%02d" % (now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec)
     s = "%02d-%02d-%02d" % (now.tm_year%100, now.tm_mon, now.tm_mday) # JY fix
     return s
 
-# 환경에서 나온 경험을 저장해두고, 랜덤하게 꺼내서 학습에 사용
+# PER로 수정된 ReplayBuffer
 class ReplayBuffer():
     def __init__(self):
-        # buffer 찰 시 오래된 데이터를 새 데이터로 (FIFO 구조)
         self.buffer = collections.deque(maxlen=buffer_limit)
+        self.priorities = collections.deque(maxlen=buffer_limit)
+        self.max_priority = 1.0
+        self.alpha = 0.6   # priority 얼마나 강하게 반영할지
 
     def put(self, transition):
         self.buffer.append(transition)
+        self.priorities.append(self.max_priority)
 
-    # n개 랜덤 샘플링
-    def sample(self, n):
-        mini_batch = random.sample(self.buffer, n)
-        # state, action, reward, next state, done
+    def sample(self, n, beta):
+        probs = np.array(self.priorities)
+        probs = probs / probs.sum()
+
+        indices = np.random.choice(len(self.buffer), n, p=probs)
+
+        # 중요도 샘플링 가중치 계산 (매개변수로 받은 beta 사용)
+        weights = (len(self.buffer) * probs[indices]) ** (-beta)
+        weights = weights / weights.max()
+
         s_lst, a_lst, r_lst, s_prime_lst, done_mask_lst = [], [], [], [], []
 
-        for transition in mini_batch:
-            s, a, r, s_prime, done_mask = transition
+        for idx in indices:
+            s, a, r, s_prime, done_mask = self.buffer[idx]
             s_lst.append(s)
-            a_lst.append([a]) # [] : shape 맞추기 위해
+            a_lst.append([a])
             r_lst.append([r])
             s_prime_lst.append(s_prime)
             done_mask_lst.append([done_mask])
 
-        return torch.tensor(s_lst, dtype=torch.float), torch.tensor(a_lst), \
-            torch.tensor(r_lst), torch.tensor(s_prime_lst, dtype=torch.float), \
-            torch.tensor(done_mask_lst)
+        return (
+            torch.tensor(s_lst, dtype=torch.float),
+            torch.tensor(a_lst),
+            torch.tensor(r_lst),
+            torch.tensor(s_prime_lst, dtype=torch.float),
+            torch.tensor(done_mask_lst),
+            indices,
+            torch.tensor(weights, dtype=torch.float)
+        )
+
+    def update_priorities(self, indices, td_errors):
+        for idx, error in zip(indices, td_errors):
+            priority = (abs(error) + 1e-5) ** self.alpha
+            self.priorities[idx] = priority
+            self.max_priority = max(self.max_priority, priority)
 
     def size(self):
         return len(self.buffer)
-
-
+    
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
         self.fc1 = nn.Linear(408, 256) # JY fix : 405 -> 408
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, 128)
-        self.fc4 = nn.Linear(128, 5) # 가능한 action 5개 
+        self.fc4 = nn.Linear(128, 7) # 가능한 action 5개 
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -92,20 +111,17 @@ class Qnet(nn.Module):
         return x
 
     def sample_action(self, obs, epsilon, memory_size):
-        # buffer가 충분히 차기 전까지는 완전 랜덤 액션 
         if memory_size < train_start:
-            return random.randint(0, 4)
+            return random.randint(0, 6)
         else:
             out = self.forward(obs) # Q값 계산
             coin = random.random()
-            # e-greedy policy
             if coin < epsilon:
-                return random.randint(0, 4)
+                return random.randint(0, 6)
             else:
                 return out.argmax().item()
 
     def action(self, obs):
-        # greedy action
         out = self.forward(obs)
         return out.argmax().item()
 
@@ -118,78 +134,75 @@ def plot_durations(laptimes):
     plt.xlabel('Episode')
     plt.ylabel('Duration')
     plt.plot(durations_t.numpy())
-    # 10개의 에피소드 평균을 가져 와서 도표 그리기
     if len(durations_t) >= 10:
         means = durations_t.unfold(0, 10, 1).mean(1).view(-1)
         means = torch.cat((torch.zeros(9), means))
         plt.plot(means.numpy())
 
-    plt.pause(0.001)  # 도표가 업데이트되도록 잠시 멈춤
+    plt.pause(0.001)
     if is_ipython:
         display.clear_output(wait=True)
         display.display(plt.gcf())
 
-
-def train(q, q_target, memory, optimizer):
+# 동적 beta 스케줄링이 반영된 train 함수
+def train(q, q_target, memory, optimizer, beta):
     for i in range(10):
-        s, a, r, s_prime, done_mask = memory.sample(batch_size)
+        s, a, r, s_prime, done_mask, indices, weights = memory.sample(batch_size, beta)
 
         q_out = q(s)
         q_a = q_out.gather(1, a)
-        max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
-        target = r + gamma * max_q_prime * done_mask
-        loss = F.smooth_l1_loss(q_a, target)
+
+        with torch.no_grad():
+            max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
+            target = r + gamma * max_q_prime * done_mask
+
+        # weighted loss (중요도 가중치 반영)
+        loss = F.smooth_l1_loss(q_a, target, reduction='none')
+        loss = (weights.unsqueeze(1) * loss).mean()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-# 1080개 데이터 다운샘플링 -> 전체 시야의 양 끝 1/8씩 버림 + 2 간격만큼 다운샘플링
+        # TD-error 업데이트
+        with torch.no_grad():
+            td_errors = torch.abs(q_a - target).cpu().numpy().flatten()
+
+        memory.update_priorities(indices, td_errors)
+
 def preprocess_lidar(ranges):
     eighth = int(len(ranges) / 8)
-
     return np.array(ranges[eighth:-eighth: 2])
 
-# JY add : input_range : 현재 range / output_range : 바꾸고자 하는 range 
 def convert_range(value, input_range, output_range):
     (in_min, in_max), (out_min, out_max) = input_range, output_range
     in_range = in_max - in_min
     out_range = out_max - out_min
-
     return (((value - in_min) * out_range) / in_range) + out_min
 
-# JY add : lidar 범위 -1 ~ 1로 변경 -> 모델 입력을 위해 
 def lidar_normalize(obs):
     return convert_range(obs, [LIDAR_MIN, LIDAR_MAX], [-1, 1])
 
-# JY add : state function
 def define_state(obs):
-    lidar_point = lidar_normalize(preprocess_lidar(obs['scans'][0])) # 약 450개 라이다 포인터 존재 -> 현재 state는 라이다 포인터만 있음
-
-    # JY add : car speed, orientation state
+    lidar_point = lidar_normalize(preprocess_lidar(obs['scans'][0]))
     car_orientation = obs['poses_theta'][0]
     car_speed = np.tanh(obs['linear_vels_x'][0] / 10.0)
-
     state = np.concatenate([lidar_point, np.array([np.sin(car_orientation), np.cos(car_orientation), car_speed])])
-
     return state
 
 def main():
     today = get_today()
     work_dir = "./" + today
-    os.makedirs(work_dir + '_' + RACETRACK + "_normalization")
+    os.makedirs(work_dir + '_'  + "add_yaw", exist_ok=True)
 
-    env = gym.make('f110_gym:f110-v0',
+    env = gym.make('f110_gym:f110-v2',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
     q = Qnet()
-    # q.load_state_dict(torch.load("{}\weigths\model_state_dict_easy1_fin.pt".format(current_dir)))
     q_target = Qnet()
     q_target.load_state_dict(q.state_dict())
     memory = ReplayBuffer()
 
-    # poses = np.array([[0., 0., np.radians(0)]])
-    # JY fix : start pos
     if RACETRACK == "map_easy3" :
         poses = np.array([[0.8007017, -0.2753365, 4.1421595]]) 
     else:
@@ -202,86 +215,74 @@ def main():
     laptimes = []
 
     for n_epi in range(10000):
-        # JY fix : 학습 시작할 때부터 linear annealing 사용
-        # if memory.size() < train_start:
-        #     epsilon = 1.0
-        # else:
-        #     epsilon = max(0.01, 0.08 - 0.01 * ((n_epi - (train_start / 100)) / 200))
-        epsilon = max(0.01, 0.08 - 0.01 * (n_epi / 200))  # Linear annealing from 8% to 1%
+        # epsilon = max(0.01, 0.08 - 0.01 * (n_epi / 200))  # Linear annealing from 8% to 1%
+        epsilon = max(0.02, 0.5 - (0.48 * (n_epi / 3000)))
+        # 🔥 beta 선형 스케줄링 (5000 에피소드 동안 0.4에서 1.0까지 선형 증가)
+        beta = min(1.0, 0.4 + (1.0 - 0.4) * (n_epi / 5000))
+        
         obs, r, done, info = env.reset(poses=poses)
-        # s = preprocess_lidar(obs['scans'][0]) # 약 450개 라이다 포인터 존재 -> 현재 state는 라이다 포인터만 있음
-        # JY add
         s = define_state(obs)
 
         done = False
-
         laptime = 0.0
 
         while not done:
-            # env.render()
-
             actions = []
 
             a = q.sample_action(torch.from_numpy(s).float(), epsilon, memory.size())
-            steer = (a - 2) * (np.pi / 30)
-            if a == 2:
-                speed = 12
-            elif a == 1 or a == 3:
-                speed = 10
+            steer = (a - 3) * (0.4189 / 3) # a=0일 때 -24도, a=3일 때 0도, a=6일 때 +24도
+
+            if a == 3:
+                speed = 10 # 직진일 때 최고 속도
+            elif a == 2 or a == 4:
+                speed = 8 # 완만한 코너
+            elif a == 1 or a == 5:
+                speed = 6  # 중간 코너
             else:
-                speed = 8
-            # JY add 
-            # steer_abs = abs(steer)
-            # speed = 20 * np.exp(-2 * steer_abs)
-            # speed = np.clip(speed, 4, 20)
+                speed = 4  # 급코너 (a=0, 6일 때 풀조향하며 감속)
 
             actions.append([steer, speed])
             actions = np.array(actions)
             obs, r, done, info = env.step(actions)
-            # s_prime = preprocess_lidar(obs['scans'][0])
-            s_prime = define_state(obs) # JY add
+            s_prime = define_state(obs)
 
             done_mask = 0.0 if done else 1.0
             memory.put((s, a, r / 100, s_prime, done_mask))
             s = s_prime
 
             laptime += r
-            # env.render(mode='human_fast')
 
             if done:
                 laptimes.append(laptime)
                 plot_durations(laptimes)
                 lap = round(obs['lap_times'][0], 3)
 
-                # 2랩 완료 했을 때 + 기존 best lab보다 빠를 때 저장
                 if int(obs['lap_counts'][0]) == 2 and fastlap > lap:
-                    torch.save(q.state_dict(), work_dir + '_' + RACETRACK + "_normalization" + '/fast-model' + str(
+                    torch.save(q.state_dict(), work_dir  + "_add_yaw" + '/fast-model' + str(
                         round(obs['lap_times'][0], 3)) + '_' + str(n_epi) + '.pt')
                     fastlap = lap
                     break
 
         if memory.size() > train_start:
-            train(q, q_target, memory, optimizer)
+            # 주입되는 beta를 기반으로 최적화 진행
+            train(q, q_target, memory, optimizer, beta)
 
         if n_epi % print_interval == 0 and n_epi != 0:
             q_target.load_state_dict(q.state_dict())
-            print("n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%"
-                  .format(n_epi, laptime / print_interval, memory.size(), epsilon * 100))
+            print("n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%, beta : {:.3f}"
+                  .format(n_epi, laptime / print_interval, memory.size(), epsilon * 100, beta))
 
     print('train finish')
     env.close()
 
 def eval():
-    env = gym.make('f110_gym:f110-v0',
+    env = gym.make('f110_gym:f110-v2',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
 
     q = Qnet()
-    # q.load_state_dict(torch.load("{}\weigths\model_state_dict_easy1_fin.pt".format(current_dir)))
-    q.load_state_dict(torch.load("26-05-13_Oschersleben_normalization/fast-model62.27_2149.pt"))
-    # poses = np.array([[0., 0., np.radians(90)]])
+    q.load_state_dict(torch.load("26-05-20_add_yaw/fast-model64.43_7169.pt"))
 
-    # JY fix: start pos
     if RACETRACK == "map_easy3" :
         poses = np.array([[0.8007017, -0.2753365, 4.1421595]]) 
     else:
@@ -290,37 +291,31 @@ def eval():
     speed = 3.0
     for t in range(5):
         obs, r, done, info = env.reset(poses=poses)
-        # s = preprocess_lidar(obs['scans'][0])
-        s = define_state(obs) # JY add
+        s = define_state(obs)
 
         env.render()
         done = False
-
         laptime = 0.0
-
+        # Str:9.60, v_middle:7.39, Wk:8.73, Sg:2.49
         while not done:
             actions = []
 
             a = q.action(torch.from_numpy(s).float())
-            steer = (a - 2) * (np.pi / 30)
-            if a == 2:
-                speed = 12
-            elif a == 1 or a == 3:
-                speed = 10
-            else:
-                speed = 8
+            steer = (a - 3) * (0.4189 / 3) # a=0일 때 -24도, a=3일 때 0도, a=6일 때 +24도
 
-            # JY add
-            # steer_abs = abs(steer)
-            # speed = 20 * np.exp(-3 * steer_abs)
-            # speed = np.clip(speed, 4, 20)
+            if a == 3:
+                speed = 9.82 # 직진일 때 최고 속도
+            elif a == 2 or a == 4:
+                speed = 6.52 # 완만한 코너
+            elif a == 1 or a == 5:
+                speed = 6.78  # 중간 코너
+            else:
+                speed = 6.49 # 급코너 (a=0, 6일 때 풀조향하며 감속)
 
             actions.append([steer, speed])
             actions = np.array(actions)
             obs, r, done, info = env.step(actions)
-            # s_prime = preprocess_lidar(obs['scans'][0])
-            s_prime = define_state(obs) # JY add
-
+            s_prime = define_state(obs)
             s = s_prime
 
             laptime += r
@@ -334,7 +329,6 @@ def eval():
 
 
 if __name__ == '__main__':
-    # JY add : parse 
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['train', 'eval'])

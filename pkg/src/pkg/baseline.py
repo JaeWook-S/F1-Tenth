@@ -17,7 +17,6 @@ is_ipython = 'inline' in matplotlib.get_backend()
 if is_ipython:
     from IPython import display
 
-# interactive ON -> plt.show() 없이도 자동으로 그래프 업데이트 / 반복문 안에서 그래프 실시간 변경 가능
 plt.ion()
 
 # Hyperparameters
@@ -30,40 +29,30 @@ train_start = 20000
 current_dir = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(current_dir)
 
-#RACETRACK = 'map_easy3'
 RACETRACK = 'Oschersleben'
 
-#JY add : parameter
-LIDAR_MIN = 0
-LIDAR_MAX = 30
-VELOCITY_MIN = -5
-VELOCITY_MAX = 20
 
 def get_today():
     now = time.localtime()
-    # s = "%04d-%02d-%02d_%02d-%02d-%02d" % (now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec)
-    s = "%02d-%02d-%02d" % (now.tm_year%100, now.tm_mon, now.tm_mday) # JY fix
+    s = "%04d-%02d-%02d_%02d-%02d-%02d" % (now.tm_year, now.tm_mon, now.tm_mday, now.tm_hour, now.tm_min, now.tm_sec)
     return s
 
-# 환경에서 나온 경험을 저장해두고, 랜덤하게 꺼내서 학습에 사용
+
 class ReplayBuffer():
     def __init__(self):
-        # buffer 찰 시 오래된 데이터를 새 데이터로 (FIFO 구조)
         self.buffer = collections.deque(maxlen=buffer_limit)
 
     def put(self, transition):
         self.buffer.append(transition)
 
-    # n개 랜덤 샘플링
     def sample(self, n):
         mini_batch = random.sample(self.buffer, n)
-        # state, action, reward, next state, done
         s_lst, a_lst, r_lst, s_prime_lst, done_mask_lst = [], [], [], [], []
 
         for transition in mini_batch:
             s, a, r, s_prime, done_mask = transition
             s_lst.append(s)
-            a_lst.append([a]) # [] : shape 맞추기 위해
+            a_lst.append([a])
             r_lst.append([r])
             s_prime_lst.append(s_prime)
             done_mask_lst.append([done_mask])
@@ -79,10 +68,10 @@ class ReplayBuffer():
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        self.fc1 = nn.Linear(408, 256) # JY fix : 405 -> 408
+        self.fc1 = nn.Linear(405, 256)
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, 128)
-        self.fc4 = nn.Linear(128, 5) # 가능한 action 5개 
+        self.fc4 = nn.Linear(128, 5)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -92,20 +81,17 @@ class Qnet(nn.Module):
         return x
 
     def sample_action(self, obs, epsilon, memory_size):
-        # buffer가 충분히 차기 전까지는 완전 랜덤 액션 
         if memory_size < train_start:
             return random.randint(0, 4)
         else:
-            out = self.forward(obs) # Q값 계산
+            out = self.forward(obs)
             coin = random.random()
-            # e-greedy policy
             if coin < epsilon:
                 return random.randint(0, 4)
             else:
                 return out.argmax().item()
 
     def action(self, obs):
-        # greedy action
         out = self.forward(obs)
         return out.argmax().item()
 
@@ -144,42 +130,19 @@ def train(q, q_target, memory, optimizer):
         loss.backward()
         optimizer.step()
 
-# 1080개 데이터 다운샘플링 -> 전체 시야의 양 끝 1/8씩 버림 + 2 간격만큼 다운샘플링
+
 def preprocess_lidar(ranges):
     eighth = int(len(ranges) / 8)
 
     return np.array(ranges[eighth:-eighth: 2])
 
-# JY add : input_range : 현재 range / output_range : 바꾸고자 하는 range 
-def convert_range(value, input_range, output_range):
-    (in_min, in_max), (out_min, out_max) = input_range, output_range
-    in_range = in_max - in_min
-    out_range = out_max - out_min
-
-    return (((value - in_min) * out_range) / in_range) + out_min
-
-# JY add : lidar 범위 -1 ~ 1로 변경 -> 모델 입력을 위해 
-def lidar_normalize(obs):
-    return convert_range(obs, [LIDAR_MIN, LIDAR_MAX], [-1, 1])
-
-# JY add : state function
-def define_state(obs):
-    lidar_point = lidar_normalize(preprocess_lidar(obs['scans'][0])) # 약 450개 라이다 포인터 존재 -> 현재 state는 라이다 포인터만 있음
-
-    # JY add : car speed, orientation state
-    car_orientation = obs['poses_theta'][0]
-    car_speed = np.tanh(obs['linear_vels_x'][0] / 10.0)
-
-    state = np.concatenate([lidar_point, np.array([np.sin(car_orientation), np.cos(car_orientation), car_speed])])
-
-    return state
 
 def main():
     today = get_today()
-    work_dir = "./" + today
-    os.makedirs(work_dir + '_' + RACETRACK + "_normalization")
+    work_dir = "./" + "baseline"
+    os.makedirs(work_dir + '_' + RACETRACK)
 
-    env = gym.make('f110_gym:f110-v0',
+    env = gym.make('f110_gym:baseline-v0',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
     q = Qnet()
@@ -188,12 +151,8 @@ def main():
     q_target.load_state_dict(q.state_dict())
     memory = ReplayBuffer()
 
-    # poses = np.array([[0., 0., np.radians(0)]])
-    # JY fix : start pos
-    if RACETRACK == "map_easy3" :
-        poses = np.array([[0.8007017, -0.2753365, 4.1421595]]) 
-    else:
-        poses = np.array([[0, 0, np.radians(345)]])
+    poses = np.array([[0., 0., np.radians(345)]])
+    # poses = np.array([[0.8007017, -0.2753365, 4.1421595]])
 
     print_interval = 10
     optimizer = optim.Adam(q.parameters(), lr=learning_rate)
@@ -202,17 +161,9 @@ def main():
     laptimes = []
 
     for n_epi in range(10000):
-        # JY fix : 학습 시작할 때부터 linear annealing 사용
-        # if memory.size() < train_start:
-        #     epsilon = 1.0
-        # else:
-        #     epsilon = max(0.01, 0.08 - 0.01 * ((n_epi - (train_start / 100)) / 200))
         epsilon = max(0.01, 0.08 - 0.01 * (n_epi / 200))  # Linear annealing from 8% to 1%
         obs, r, done, info = env.reset(poses=poses)
-        # s = preprocess_lidar(obs['scans'][0]) # 약 450개 라이다 포인터 존재 -> 현재 state는 라이다 포인터만 있음
-        # JY add
-        s = define_state(obs)
-
+        s = preprocess_lidar(obs['scans'][0])
         done = False
 
         laptime = 0.0
@@ -225,22 +176,15 @@ def main():
             a = q.sample_action(torch.from_numpy(s).float(), epsilon, memory.size())
             steer = (a - 2) * (np.pi / 30)
             if a == 2:
-                speed = 12
+                speed = 5.0
             elif a == 1 or a == 3:
-                speed = 10
+                speed = 4.5
             else:
-                speed = 8
-            # JY add 
-            # steer_abs = abs(steer)
-            # speed = 20 * np.exp(-2 * steer_abs)
-            # speed = np.clip(speed, 4, 20)
-
+                speed = 4.0
             actions.append([steer, speed])
             actions = np.array(actions)
             obs, r, done, info = env.step(actions)
-            # s_prime = preprocess_lidar(obs['scans'][0])
-            s_prime = define_state(obs) # JY add
-
+            s_prime = preprocess_lidar(obs['scans'][0])
             done_mask = 0.0 if done else 1.0
             memory.put((s, a, r / 100, s_prime, done_mask))
             s = s_prime
@@ -252,10 +196,8 @@ def main():
                 laptimes.append(laptime)
                 plot_durations(laptimes)
                 lap = round(obs['lap_times'][0], 3)
-
-                # 2랩 완료 했을 때 + 기존 best lab보다 빠를 때 저장
                 if int(obs['lap_counts'][0]) == 2 and fastlap > lap:
-                    torch.save(q.state_dict(), work_dir + '_' + RACETRACK + "_normalization" + '/fast-model' + str(
+                    torch.save(q.state_dict(), work_dir + '_' + RACETRACK + '/fast-model' + str(
                         round(obs['lap_times'][0], 3)) + '_' + str(n_epi) + '.pt')
                     fastlap = lap
                     break
@@ -271,27 +213,19 @@ def main():
     print('train finish')
     env.close()
 
+
 def eval():
     env = gym.make('f110_gym:f110-v0',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
 
     q = Qnet()
-    # q.load_state_dict(torch.load("{}\weigths\model_state_dict_easy1_fin.pt".format(current_dir)))
-    q.load_state_dict(torch.load("26-05-13_Oschersleben_normalization/fast-model62.27_2149.pt"))
-    # poses = np.array([[0., 0., np.radians(90)]])
-
-    # JY fix: start pos
-    if RACETRACK == "map_easy3" :
-        poses = np.array([[0.8007017, -0.2753365, 4.1421595]]) 
-    else:
-        poses = np.array([[0, 0, np.radians(345)]])
-    
+    q.load_state_dict(torch.load("baseline_Oschersleben/fast-model111.28_5180.pt"))
+    poses = np.array([[0., 0., np.radians(345)]])
     speed = 3.0
     for t in range(5):
         obs, r, done, info = env.reset(poses=poses)
-        # s = preprocess_lidar(obs['scans'][0])
-        s = define_state(obs) # JY add
+        s = preprocess_lidar(obs['scans'][0])
 
         env.render()
         done = False
@@ -304,22 +238,15 @@ def eval():
             a = q.action(torch.from_numpy(s).float())
             steer = (a - 2) * (np.pi / 30)
             if a == 2:
-                speed = 12
+                speed = 5.0
             elif a == 1 or a == 3:
-                speed = 10
+                speed = 4.5
             else:
-                speed = 8
-
-            # JY add
-            # steer_abs = abs(steer)
-            # speed = 20 * np.exp(-3 * steer_abs)
-            # speed = np.clip(speed, 4, 20)
-
+                speed = 4.0
             actions.append([steer, speed])
             actions = np.array(actions)
             obs, r, done, info = env.step(actions)
-            # s_prime = preprocess_lidar(obs['scans'][0])
-            s_prime = define_state(obs) # JY add
+            s_prime = preprocess_lidar(obs['scans'][0])
 
             s = s_prime
 
@@ -334,13 +261,5 @@ def eval():
 
 
 if __name__ == '__main__':
-    # JY add : parse 
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['train', 'eval'])
-    args = parser.parse_args()
-
-    if args.mode == 'train':
-        main()
-    elif args.mode == 'eval':
-        eval()
+    # main()
+    eval()
