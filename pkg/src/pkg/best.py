@@ -298,6 +298,7 @@ def eval():
 
             a = q.action(torch.from_numpy(s).float())
             steer = (a - 2) * (np.pi / 30)
+            
             if a == 2: # 11.23, 9.70, 6.65
                 speed = 10.9912
             elif a == 1 or a == 3:
@@ -320,7 +321,7 @@ def eval():
             s = s_prime
 
             laptime += r
-            env.render(mode='human')
+            env.render(mode='human_fast')
 
             if done:
                 lap = round(obs['lap_times'][0], 3)

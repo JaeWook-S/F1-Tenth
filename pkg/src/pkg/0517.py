@@ -124,6 +124,14 @@ class Qnet(nn.Module):
     def action(self, obs):
         out = self.forward(obs)
         return out.argmax().item()
+    
+    def eval_action(self, obs, epsilon):
+        out = self.forward(obs)
+        coin = random.random()
+        if coin < epsilon:
+            return random.randint(0, 6)
+        else:
+            return out.argmax().item()
 
 
 def plot_durations(laptimes):
@@ -231,7 +239,7 @@ def main():
 
             a = q.sample_action(torch.from_numpy(s).float(), epsilon, memory.size())
             steer = (a - 3) * (0.4189 / 3) # a=0일 때 -24도, a=3일 때 0도, a=6일 때 +24도
-
+                             
             if a == 3:
                 speed = 10 # 직진일 때 최고 속도
             elif a == 2 or a == 4:
@@ -281,7 +289,7 @@ def eval():
                    map_ext=".png", num_agents=1)
 
     q = Qnet()
-    q.load_state_dict(torch.load("26-05-17_add_reward/fast-model37.99_5010.pt"))
+    q.load_state_dict(torch.load("26-05-17_add_reward/fast-model72.08_3487.pt"))
 
     if RACETRACK == "map_easy3" :
         poses = np.array([[0.8007017, -0.2753365, 4.1421595]]) 
@@ -301,6 +309,7 @@ def eval():
             actions = []
 
             a = q.action(torch.from_numpy(s).float())
+            # a = q.eval_action(torch.from_numpy(s).float(), epsilon=0.02)
             steer = (a - 3) * (0.4189 / 3) # a=0일 때 -24도, a=3일 때 0도, a=6일 때 +24도
 
             if a == 3:
@@ -319,7 +328,7 @@ def eval():
             s = s_prime
 
             laptime += r
-            env.render(mode='human')
+            env.render(mode='human_fast')
 
             if done:
                 lap = round(obs['lap_times'][0], 3)
