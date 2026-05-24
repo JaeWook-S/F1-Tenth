@@ -29,6 +29,9 @@ train_start = 20000
 # EMA 조향 스무딩 계수 (속도 20 영역의 슬립 방지를 위한 필수 장치)
 SMOOTHING_ALPHA = 0.3 
 
+# 💡 [4-step TD 하이퍼파라미터 정의]
+N_STEP = 4  # 4스텝 전방 지평선 확장 (고속 진입 관성 예측 최적화)
+
 current_dir = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(current_dir)
 
@@ -62,30 +65,56 @@ class ReplayBuffer():
         self.buffer.append(transition)
         self.priorities.append(self.max_priority)
 
-    def sample(self, n, beta):
+    def sample(self, n_samples, beta):
         probs = np.array(self.priorities)
         probs = probs / probs.sum()
 
-        indices = np.random.choice(len(self.buffer), n, p=probs)
+        # ⚡ [수정] 4-step 미래 조회를 위해 샘플링 범위를 버퍼 끝 마진(N_STEP)만큼 제외
+        valid_len = len(self.buffer) - N_STEP
+        if valid_len <= 0:
+            indices = np.random.choice(len(self.buffer), n_samples, p=probs)
+        else:
+            valid_probs = probs[:valid_len]
+            valid_probs = valid_probs / valid_probs.sum()
+            indices = np.random.choice(valid_len, n_samples, p=valid_probs)
 
         weights = (len(self.buffer) * probs[indices]) ** (-beta)
         weights = weights / weights.max()
 
-        s_lst, a_lst, r_lst, s_prime_lst, done_mask_lst = [], [], [], [], []
+        s_lst, a_lst, r_n_lst, s_n_lst, done_mask_lst = [], [], [], [], []
 
         for idx in indices:
-            s, a, r, s_prime, done_mask = self.buffer[idx]
+            s, a, r, _, _ = self.buffer[idx]
+            
+            # ⚡ [수정] 4-step Return 보상 복리 계산부
+            n_reward = 0.0
+            discount = 1.0
+            final_done_mask = 1.0
+            s_n = None
+            
+            for k in range(N_STEP):
+                if idx + k < len(self.buffer):
+                    curr_s, curr_a, curr_r, curr_s_prime, curr_done_mask = self.buffer[idx + k]
+                    n_reward += discount * curr_r
+                    discount *= gamma
+                    
+                    if curr_done_mask == 0.0:
+                        final_done_mask = 0.0
+                        s_n = curr_s_prime
+                        break
+                    s_n = curr_s_prime
+            
             s_lst.append(s)
             a_lst.append([a])
-            r_lst.append([r])
-            s_prime_lst.append(s_prime)
-            done_mask_lst.append([done_mask])
+            r_n_lst.append([n_reward])
+            s_n_lst.append(s_n)
+            done_mask_lst.append([final_done_mask])
 
         return (
             torch.tensor(np.array(s_lst), dtype=torch.float),
             torch.tensor(a_lst),
-            torch.tensor(r_lst, dtype=torch.float),
-            torch.tensor(np.array(s_prime_lst), dtype=torch.float),
+            torch.tensor(r_n_lst, dtype=torch.float),
+            torch.tensor(np.array(s_n_lst), dtype=torch.float),
             torch.tensor(done_mask_lst, dtype=torch.float),
             indices,
             torch.tensor(weights, dtype=torch.float)
@@ -94,8 +123,9 @@ class ReplayBuffer():
     def update_priorities(self, indices, td_errors):
         for idx, error in zip(indices, td_errors):
             priority = (abs(error) + 1e-5) ** self.alpha
-            self.priorities[idx] = priority
-            self.max_priority = max(self.max_priority, priority)
+            if idx < len(self.priorities):
+                self.priorities[idx] = priority
+                self.max_priority = max(self.max_priority, priority)
 
     def size(self):
         return len(self.buffer)
@@ -106,7 +136,7 @@ class Qnet(nn.Module):
         self.fc1 = nn.Linear(110, 256) 
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, 128)
-        self.fc4 = nn.Linear(128, 5) 
+        self.fc4 = nn.Linear(128, 5) # 💡 5개 액션 레이아웃 정직하게 고수
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -150,15 +180,17 @@ def plot_durations(laptimes):
 
 def train(q, q_target, memory, optimizer, beta):
     for i in range(10):
-        s, a, r, s_prime, done_mask, indices, weights = memory.sample(batch_size, beta)
+        # 💡 ReplayBuffer로부터 4스텝 미래 지평선이 압축된 리턴 및 다음 타겟 상태 수령
+        s, a, r_n, s_n, done_mask, indices, weights = memory.sample(batch_size, beta)
 
         q_out = q(s)
         q_a = q_out.gather(1, a)
 
         with torch.no_grad():
-            argmax_a = q(s_prime).argmax(dim=1, keepdim=True)
-            max_q_prime = q_target(s_prime).gather(1, argmax_a)
-            target = r + gamma * max_q_prime * done_mask
+            # ⚡ [수정] Double DQN 구조와 4-step Bellman Target 연산 최적화 동기화
+            argmax_a = q(s_n).argmax(dim=1, keepdim=True)
+            max_q_prime = q_target(s_n).gather(1, argmax_a)
+            target = r_n + (gamma ** N_STEP) * max_q_prime * done_mask
 
         loss = F.smooth_l1_loss(q_a, target, reduction='none')
         loss = (weights.unsqueeze(1) * loss).mean()
@@ -198,9 +230,9 @@ def define_state(obs, prev_steer):
 def main():
     today = get_today()
     work_dir = "./" + today
-    os.makedirs(work_dir + "_ddqn_v2", exist_ok=True)
+    os.makedirs(work_dir + "_ddqn_v4_4step", exist_ok=True)
 
-    env = gym.make('f110_gym:f110-v3',
+    env = gym.make('f110_gym:f110-v1',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
     q = Qnet()
@@ -213,12 +245,11 @@ def main():
     fastlap = 10000.0
     laptimes = []
 
-    # 💡 [커리큘럼 락 메커니즘 변수 정의]
-    current_max_speed = 8.0      # 안전하게 5.0m/s로 학습 빌드업 시작
-    target_top_speed = 20.0      # 최종 도달 목표 최고 속도
-    consecutive_success = 0      # 실시간 연속 완주 성공 횟수 체크 카운터
-    required_success = 3         # 속도 락 해제를 위한 필수 연속 완주 조건
-    speed_increment = 0.2        # 뇌가 패닉에 빠지지 않도록 올리는 안전한 속도 스텝 크기
+    # 💡 [초고속 해금 영역용 정밀 스케줄러 세팅]
+    current_max_speed = 9.0      # 검증이 완료된 안정 지대 시속 10.0m/s부터 4스텝 TD 훈련 스타트
+    target_top_speed = 20.0      
+    consecutive_success = 0      
+    required_success = 2         # 억까 연속 매칭 스폰 방지를 위해 완화 (2회 연속 완주 시 해금)
 
     for n_epi in range(10000):
         epsilon = max(0.01, 1.0 * (0.998 ** n_epi))
@@ -250,13 +281,22 @@ def main():
             target_steer = (a - 2) * (np.pi / 30)
             steer = (SMOOTHING_ALPHA * target_steer) + ((1.0 - SMOOTHING_ALPHA) * prev_steer)
             
-            # 고속 원심력 극복을 위한 비선형 감속 기어비 세팅
-            if a == 2:
-                speed = current_max_speed          # 직진 주로: 완전 개방
-            elif a == 1 or a == 3:
-                speed = current_max_speed * 0.85   
+            # ⚡ [수정] 5개 액션 구조용 초고속 v3 하이브리드 기어비 스케줄링
+            if current_max_speed >= 10.0:
+                if a == 2:
+                    speed = current_max_speed          # 완전 직진 주로: 100% 개방
+                elif a == 1 or a == 3:
+                    speed = current_max_speed * 0.88   # 완만 코너: 탄력 극대화 (88% 크루징)
+                else:
+                    speed = current_max_speed * 0.52   # 하드 코너: 탈출 마진 확보를 위한 하드 감속 (52%)
             else:
-                speed = current_max_speed * 0.6   # 급코너: 55% 하드 브레이킹
+                # 10m/s 미만 빌드업용 기존 기어 매핑
+                if a == 2:
+                    speed = current_max_speed
+                elif a == 1 or a == 3:
+                    speed = current_max_speed * 0.85
+                else:
+                    speed = current_max_speed * 0.60
 
             actions.append([steer, speed])
             actions = np.array(actions)
@@ -265,11 +305,10 @@ def main():
             s_prime = define_state(obs, steer)
             done_mask = 0.0 if done else 1.0
 
-            # 베이스라인과의 공정한 정량 비교를 위한 정석 스케일 r/100.0 원복
             memory.put((s, a, r / 100.0, s_prime, done_mask))
             
             s = s_prime
-            prev_steer = steer  # 조향 연속성 동기화
+            prev_steer = steer  
             laptime += r 
 
             if done:
@@ -277,23 +316,26 @@ def main():
                 plot_durations(laptimes)
                 lap = round(obs['lap_times'][0], 3)
 
-                # 💡 [연속 완주 기반 속도 해금 제어부]
                 if int(obs['lap_counts'][0]) == 2:
-                    consecutive_success += 1  # 연속 완주 달성 성공 카운트업
+                    consecutive_success += 1  
                     
-                    # 5연속 주행을 완벽히 소화해 내서 순수 실력이 증명됐다면
                     if consecutive_success >= required_success:
                         if current_max_speed < target_top_speed:
-                            current_max_speed = min(target_top_speed, current_max_speed + speed_increment)
-                        consecutive_success = 0  # 속도가 승격되었으므로 새 레벨 적응을 위해 카운터 초기화
+                            # ⚡ [수정] 10.0m/s 이상부터 0.1m/s씩 정밀 승격 메커니즘
+                            speed_step = 0.1 if current_max_speed >= 10.0 else 0.2
+                            current_max_speed = min(target_top_speed, current_max_speed + speed_step)
+                            
+                            # # 🧠 속도 승격 시 굳어버린 탐험률을 일시 복구하여 고속 적응력 극대화
+                            if current_max_speed >= 10.0:
+                                epsilon = max(epsilon, 0.15)
+                                
+                        consecutive_success = 0  
                     
-                    # 베스트 랩 갱신 조건 만족 시 가중치 백업 (파일명에 출발 idx 및 maxV 명시)
                     if fastlap > lap:        
                         fastlap = lap
-                        save_name = f"{work_dir}_ddqn_v2/fast-model_{lap:.2f}sec_idx{random_idx}_maxV{current_max_speed:.1f}_epi{n_epi}.pt"
+                        save_name = f"{work_dir}_ddqn_v4_4step/fast-model_{lap:.2f}sec_idx{random_idx}_maxV{current_max_speed:.1f}_epi{n_epi}.pt"
                         torch.save(q.state_dict(), save_name)
                 else:
-                    # 억까 자리에 스폰되었든, 조향 실수든 도중에 한 번이라도 터지면 카운터 무조건 가차 없이 '리셋'
                     consecutive_success = 0
 
                 break
@@ -303,7 +345,6 @@ def main():
 
         if n_epi % print_interval == 0 and n_epi != 0:
             q_target.load_state_dict(q.state_dict())
-            # 연속 완주 현황(Streak: 현재카운트/5)을 실시간 모니터링할 수 있도록 프린트문 고도화
             print("n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%, max_speed : {:.1f}m/s (Streak: {}/{})"
                   .format(n_epi, laptime, memory.size(), epsilon * 100, current_max_speed, consecutive_success, required_success))
 
@@ -311,16 +352,15 @@ def main():
     env.close()
 
 def eval():
-    env = gym.make('f110_gym:f110-v3',
+    env = gym.make('f110_gym:f110-v1',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
 
     q = Qnet()
-    # 📝 [테스트 가이드] 중간 점검할 때 검증하고 싶은 최신 pt 파일명을 여기에 교체해 주시면 됩니다.
-    q.load_state_dict(torch.load("26-05-23_ddqn_v2/fast-model_60.52sec_idx192_maxV10.4_epi8319.pt"))
+    # 📝 [테스트 가이드] 새롭게 추출한 v3_4step 폴더 안의 검증 가중치를 로드하세요.
+    q.load_state_dict(torch.load("26-05-24_ddqn_v4_4step/fast-model_59.66sec_idx428_maxV10.4_epi7421.pt"))
 
-    # [안전 출발선 배치] eval 모드 실행 시 억까 당하지 않도록 트랙 선상 위의 정방향 안전 라인에서 출발시킵니다.
-    start_idx = 192
+    start_idx = 428
     start_x = waypoints[start_idx][0]
     start_y = waypoints[start_idx][1]
     next_idx = (start_idx + 1) % num_waypoints
@@ -330,7 +370,7 @@ def eval():
     
     poses = np.array([[start_x, start_y, start_theta]])
     
-    # [테스트 가이드] 내가 가져온 모델 가중치 파일 이름에 적힌 maxV 값을 여기에 그대로 동기화해 주세요.
+    # [동기화 매칭] 테스트할 모델 파일에 찍힌 maxV 값을 기입하세요.
     current_eval_max = 10.4
     
     for t in range(5):
@@ -345,17 +385,24 @@ def eval():
             actions = []
             a = q.action(torch.from_numpy(s).float())
             
-            # train과 완전 일치하게 연동시킨 스무딩 공식
             target_steer = (a - 2) * (np.pi / 30)
             steer = (SMOOTHING_ALPHA * target_steer) + ((1.0 - SMOOTHING_ALPHA) * prev_steer)
 
-            # train과 동일한 비율의 감속 크루징 기어 매핑
-            if a == 2:
-                speed = current_eval_max
-            elif a == 1 or a == 3:
-                speed = current_eval_max * 0.85 # 0.85
+            # v3 평가 모드 하이브리드 감속 기어 동기화
+            if current_eval_max >= 10.0:
+                if a == 2:
+                    speed = current_eval_max
+                elif a == 1 or a == 3:
+                    speed = current_eval_max * 0.88
+                else:
+                    speed = current_eval_max * 0.52
             else:
-                speed = current_eval_max * 0.6 # 0.60
+                if a == 2:
+                    speed = current_eval_max
+                elif a == 1 or a == 3:
+                    speed = current_eval_max * 0.85
+                else:
+                    speed = current_eval_max * 0.60
 
             actions.append([steer, speed])
             actions = np.array(actions)
@@ -368,7 +415,7 @@ def eval():
 
             if done:
                 lap = round(obs['lap_times'][0], 3)
-                print(f"[EVAL {t}] 실제 물리 엔진 정량 랩타임: {lap:.3f} sec (완주 판단: {int(obs['lap_counts'][0]) == 2})")
+                print(f"[EVAL {t}] lap_time: {lap:.3f} sec")
                 break
     env.close()
 

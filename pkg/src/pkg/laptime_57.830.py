@@ -232,7 +232,7 @@ def main():
     work_dir = "./" + today
     os.makedirs(work_dir + "_ddqn_v3_4step", exist_ok=True)
 
-    env = gym.make('f110_gym:f110-v3',
+    env = gym.make('f110_gym:f110-v1',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
     q = Qnet()
@@ -352,7 +352,7 @@ def main():
     env.close()
 
 def eval():
-    env = gym.make('f110_gym:f110-v3',
+    env = gym.make('f110_gym:f110-v1',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
 
@@ -411,7 +411,7 @@ def eval():
             s_prime = define_state(obs, steer)
             s = s_prime
             prev_steer = steer
-            env.render(mode='human')
+            env.render(mode='human_fast')
 
             if done:
                 lap = round(obs['lap_times'][0], 3)

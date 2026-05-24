@@ -23,10 +23,10 @@ plt.ion()
 learning_rate = 0.00005
 gamma = 0.98
 buffer_limit = 50000
-batch_size = 64  # 대규모 GPU 연산을 활용하기 위해 스케일업
+batch_size = 64  
 train_start = 20000
 
-# EMA 조향 스무딩 계수 
+# EMA 조향 스무딩 계수 (속도 20 영역의 슬립 방지를 위한 필수 장치)
 SMOOTHING_ALPHA = 0.3 
 
 current_dir = os.path.abspath(os.path.dirname(__file__))
@@ -103,7 +103,6 @@ class ReplayBuffer():
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        # State 차원: Min-Pooling (108개) + (speed, prev_steer 2개) = 110 차원
         self.fc1 = nn.Linear(110, 256) 
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, 128)
@@ -129,7 +128,6 @@ class Qnet(nn.Module):
 
     def action(self, obs):
         out = self.forward(obs)
-        # 평가(Eval) 시에는 노이즈 없이 100% Greedy 행동
         return out.argmax().item()
 
 def plot_durations(laptimes):
@@ -157,7 +155,6 @@ def train(q, q_target, memory, optimizer, beta):
         q_out = q(s)
         q_a = q_out.gather(1, a)
 
-        # Double DQN (DDQN)
         with torch.no_grad():
             argmax_a = q(s_prime).argmax(dim=1, keepdim=True)
             max_q_prime = q_target(s_prime).gather(1, argmax_a)
@@ -201,9 +198,9 @@ def define_state(obs, prev_steer):
 def main():
     today = get_today()
     work_dir = "./" + today
-    os.makedirs(work_dir + "_ddqn", exist_ok=True)
+    os.makedirs(work_dir + "_ddqn_v2", exist_ok=True)
 
-    env = gym.make('f110_gym:f110-v3',
+    env = gym.make('f110_gym:f110-v1',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
     q = Qnet()
@@ -216,13 +213,17 @@ def main():
     fastlap = 10000.0
     laptimes = []
 
+    # 💡 [커리큘럼 락 메커니즘 변수 정의]
+    current_max_speed = 8.0      # 안전하게 5.0m/s로 학습 빌드업 시작
+    target_top_speed = 20.0      # 최종 도달 목표 최고 속도
+    consecutive_success = 0      # 실시간 연속 완주 성공 횟수 체크 카운터
+    required_success = 3         # 속도 락 해제를 위한 필수 연속 완주 조건
+    speed_increment = 0.2        # 뇌가 패닉에 빠지지 않도록 올리는 안전한 속도 스텝 크기
+
     for n_epi in range(10000):
-        # Epsilon 스케줄링 (충분한 탐험을 위해 1.0에서 천천히 감소)
-        #epsilon = max(0.01, 1.0 - (0.98 * (n_epi / 6000)))
         epsilon = max(0.01, 1.0 * (0.998 ** n_epi))
         beta = min(1.0, 0.4 + (1.0 - 0.4) * (n_epi / 10000))
 
-        # 랜덤 스폰 위치 및 방향 계산
         random_idx = random.randint(0, num_waypoints - 1)
         rand_x = waypoints[random_idx][0]
         rand_y = waypoints[random_idx][1]
@@ -245,30 +246,17 @@ def main():
             actions = []
             a = q.sample_action(torch.from_numpy(s).float(), epsilon, memory.size())
             
-            steer = (a - 2) * (np.pi / 30)
-            #steer = (SMOOTHING_ALPHA * target_steer) + ((1.0 - SMOOTHING_ALPHA) * prev_steer)
+            # 조향 스무딩(EMA) 필터 활성화
+            target_steer = (a - 2) * (np.pi / 30)
+            steer = (SMOOTHING_ALPHA * target_steer) + ((1.0 - SMOOTHING_ALPHA) * prev_steer)
             
-            # 고속 코너링 기어비 튜닝
-            # if a == 3:
-            #     speed = 10.0
-            # elif a == 2 or a == 4:
-            #     speed = 9.5  
-            # elif a == 1 or a == 5:
-            #     speed = 7.0  
-            # else:
-            #     speed = 4.5  
-            # if a == 2:
-            #     speed = 12
-            # elif a == 1 or a == 3:
-            #     speed = 10
-            # else:
-            #     speed = 8
+            # 고속 원심력 극복을 위한 비선형 감속 기어비 세팅
             if a == 2:
-                speed = 5
+                speed = current_max_speed          # 직진 주로: 완전 개방
             elif a == 1 or a == 3:
-                speed = 4.5
+                speed = current_max_speed * 0.85   
             else:
-                speed = 4
+                speed = current_max_speed * 0.6   # 급코너: 55% 하드 브레이킹
 
             actions.append([steer, speed])
             actions = np.array(actions)
@@ -277,57 +265,73 @@ def main():
             s_prime = define_state(obs, steer)
             done_mask = 0.0 if done else 1.0
 
-            # Env에서 계산된 보상을 스케일링만 하여 바로 적용 (추가 감점 로직 제거)
-            memory.put((s, a, r / 10.0, s_prime, done_mask))
+            # 베이스라인과의 공정한 정량 비교를 위한 정석 스케일 r/100.0 원복
+            memory.put((s, a, r / 100.0, s_prime, done_mask))
             
             s = s_prime
-            # prev_steer = steer
-            laptime += r # Env에서 넘겨주는 r(timestep)을 누적하여 실제 경과 시간 계산
+            prev_steer = steer  # 조향 연속성 동기화
+            laptime += r 
 
             if done:
                 laptimes.append(laptime)
                 plot_durations(laptimes)
                 lap = round(obs['lap_times'][0], 3)
 
-                # 2랩 완료 했을 때 + 기존 best lab보다 빠를 때 저장
-                if int(obs['lap_counts'][0]) == 2 and fastlap > lap:        
-                    fastlap = lap
-                    save_name = f"{work_dir}_ddqn/fast-model_{lap:.2f}sec_idx{random_idx}_epi{n_epi}.pt"
-                    torch.save(q.state_dict(), save_name)
+                # 💡 [연속 완주 기반 속도 해금 제어부]
+                if int(obs['lap_counts'][0]) == 2:
+                    consecutive_success += 1  # 연속 완주 달성 성공 카운트업
+                    
+                    # 5연속 주행을 완벽히 소화해 내서 순수 실력이 증명됐다면
+                    if consecutive_success >= required_success:
+                        if current_max_speed < target_top_speed:
+                            current_max_speed = min(target_top_speed, current_max_speed + speed_increment)
+                        consecutive_success = 0  # 속도가 승격되었으므로 새 레벨 적응을 위해 카운터 초기화
+                    
+                    # 베스트 랩 갱신 조건 만족 시 가중치 백업 (파일명에 출발 idx 및 maxV 명시)
+                    if fastlap > lap:        
+                        fastlap = lap
+                        save_name = f"{work_dir}_ddqn_v2/fast-model_{lap:.2f}sec_idx{random_idx}_maxV{current_max_speed:.1f}_epi{n_epi}.pt"
+                        torch.save(q.state_dict(), save_name)
+                else:
+                    # 억까 자리에 스폰되었든, 조향 실수든 도중에 한 번이라도 터지면 카운터 무조건 가차 없이 '리셋'
+                    consecutive_success = 0
+
                 break
-        
-        # 평균적인 성능 검증을 위한 주기적 모델 저장
-        # if n_epi > 0 and n_epi % 1000 == 0:
-        #     torch.save(q.state_dict(), work_dir + "_ddqn" + f'/periodic-model_{n_epi}.pt')
 
         if memory.size() > train_start:
             train(q, q_target, memory, optimizer, beta)
 
         if n_epi % print_interval == 0 and n_epi != 0:
             q_target.load_state_dict(q.state_dict())
-            print("n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%, beta : {:.3f}"
-                  .format(n_epi, laptime, memory.size(), epsilon * 100, beta))
+            # 연속 완주 현황(Streak: 현재카운트/5)을 실시간 모니터링할 수 있도록 프린트문 고도화
+            print("n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%, max_speed : {:.1f}m/s (Streak: {}/{})"
+                  .format(n_epi, laptime, memory.size(), epsilon * 100, current_max_speed, consecutive_success, required_success))
 
     print('train finish')
     env.close()
 
 def eval():
-    env = gym.make('f110_gym:f110-v3',
+    env = gym.make('f110_gym:f110-v1',
                    map="{}/maps/{}".format(current_dir, RACETRACK),
                    map_ext=".png", num_agents=1)
 
     q = Qnet()
-    # 주의: 훈련 시 저장된 모델 경로에 맞게 수정
-    q.load_state_dict(torch.load("26-05-23_ddqn/fast-model_109.28sec_idx725_epi2731.pt"))
+    # 📝 [테스트 가이드] 중간 점검할 때 검증하고 싶은 최신 pt 파일명을 여기에 교체해 주시면 됩니다.
+    q.load_state_dict(torch.load("26-05-23_ddqn_v2/fast-model_60.52sec_idx192_maxV10.4_epi8319.pt"))
 
-    # Eval 시에는 시작 지점을 트랙의 첫 번째 웨이포인트(정방향)로 고정하여 성능을 일정하게 비교
-    # start_x, start_y = waypoints[11][0], waypoints[11][1]
-    # dx = waypoints[11][0] - start_x
-    # dy = waypoints[11][1] - start_y
-    # start_theta = np.arctan2(dy, dx)
+    # [안전 출발선 배치] eval 모드 실행 시 억까 당하지 않도록 트랙 선상 위의 정방향 안전 라인에서 출발시킵니다.
+    start_idx = 192
+    start_x = waypoints[start_idx][0]
+    start_y = waypoints[start_idx][1]
+    next_idx = (start_idx + 1) % num_waypoints
+    dx = waypoints[next_idx][0] - start_x
+    dy = waypoints[next_idx][1] - start_y
+    start_theta = np.arctan2(dy, dx)
     
-    # poses = np.array([[start_x, start_y, start_theta]])
-    poses = np.array([[0., 0., np.radians(345)]])
+    poses = np.array([[start_x, start_y, start_theta]])
+    
+    # [테스트 가이드] 내가 가져온 모델 가중치 파일 이름에 적힌 maxV 값을 여기에 그대로 동기화해 주세요.
+    current_eval_max = 10.4
     
     for t in range(5):
         obs, r, done, info = env.reset(poses=poses)
@@ -336,36 +340,35 @@ def eval():
 
         env.render()
         done = False
-        laptime = 0.0
         
         while not done:
             actions = []
             a = q.action(torch.from_numpy(s).float())
             
-            steer = (a - 2) * (np.pi / 30)
+            # train과 완전 일치하게 연동시킨 스무딩 공식
+            target_steer = (a - 2) * (np.pi / 30)
+            steer = (SMOOTHING_ALPHA * target_steer) + ((1.0 - SMOOTHING_ALPHA) * prev_steer)
 
+            # train과 동일한 비율의 감속 크루징 기어 매핑
             if a == 2:
-                speed = 5
+                speed = current_eval_max
             elif a == 1 or a == 3:
-                speed = 4.5
+                speed = current_eval_max * 0.85 # 0.85
             else:
-                speed = 4
+                speed = current_eval_max * 0.6 # 0.60
 
             actions.append([steer, speed])
             actions = np.array(actions)
             obs, r, done, info = env.step(actions)
             
             s_prime = define_state(obs, steer)
-            
             s = s_prime
             prev_steer = steer
-
-            laptime += r
             env.render(mode='human_fast')
 
             if done:
                 lap = round(obs['lap_times'][0], 3)
-                print(f"[EVAL {t}] lap_time: {lap:.3f} sec")
+                print(f"[EVAL {t}] 실제 물리 엔진 정량 랩타임: {lap:.3f} sec (완주 판단: {int(obs['lap_counts'][0]) == 2})")
                 break
     env.close()
 
@@ -379,5 +382,3 @@ if __name__ == '__main__':
         main()
     elif args.mode == 'eval':
         eval()
-
-# epsilon = max(0.01, 1.0 * (0.998 ** n_epi)) 해보기
