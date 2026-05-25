@@ -26,18 +26,18 @@ buffer_limit = 50000
 batch_size = 64  
 train_start = 20000
 
-# EMA 조향 스무딩 계수 (속도 20 영역의 슬립 방지를 위한 필수 장치)
+# EMA 조향 스무딩 계수 
 SMOOTHING_ALPHA = 0.3 
 
-# 💡 [4-step TD 하이퍼파라미터 정의]
-N_STEP = 4  # 4스텝 전방 지평선 확장 (고속 진입 관성 예측 최적화)
+# n-step TD 파라미터
+N_STEP = 4
 
 current_dir = os.path.abspath(os.path.dirname(__file__))
 sys.path.append(current_dir)
 
 RACETRACK = 'Oschersleben'
 
-# 리다이 및 속도 파라미터
+# 라이다 및 속도 파라미터
 LIDAR_MIN = 0
 LIDAR_MAX = 30
 VELOCITY_MIN = -5
@@ -69,7 +69,7 @@ class ReplayBuffer():
         probs = np.array(self.priorities)
         probs = probs / probs.sum()
 
-        # ⚡ [수정] 4-step 미래 조회를 위해 샘플링 범위를 버퍼 끝 마진(N_STEP)만큼 제외
+        # 4-step을 위해 샘플링 범위를 버퍼 끝 마진(N_STEP)만큼 제외
         valid_len = len(self.buffer) - N_STEP
         if valid_len <= 0:
             indices = np.random.choice(len(self.buffer), n_samples, p=probs)
@@ -86,7 +86,7 @@ class ReplayBuffer():
         for idx in indices:
             s, a, r, _, _ = self.buffer[idx]
             
-            # ⚡ [수정] 4-step Return 보상 복리 계산부
+            # 4-step Return 보상 복리 계산부
             n_reward = 0.0
             discount = 1.0
             final_done_mask = 1.0
@@ -136,7 +136,7 @@ class Qnet(nn.Module):
         self.fc1 = nn.Linear(110, 256) 
         self.fc2 = nn.Linear(256, 128)
         self.fc3 = nn.Linear(128, 128)
-        self.fc4 = nn.Linear(128, 5) # 💡 5개 액션 레이아웃 정직하게 고수
+        self.fc4 = nn.Linear(128, 5) 
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -180,14 +180,14 @@ def plot_durations(laptimes):
 
 def train(q, q_target, memory, optimizer, beta):
     for i in range(10):
-        # 💡 ReplayBuffer로부터 4스텝 미래 지평선이 압축된 리턴 및 다음 타겟 상태 수령
+        # ReplayBuffer로부터 4스텝 리턴 및 다음 타겟 상태 
         s, a, r_n, s_n, done_mask, indices, weights = memory.sample(batch_size, beta)
 
         q_out = q(s)
         q_a = q_out.gather(1, a)
 
         with torch.no_grad():
-            # ⚡ [수정] Double DQN 구조와 4-step Bellman Target 연산 최적화 동기화
+            # Double DQN 구조와 4-step Bellman Target 연산 최적화 동기화
             argmax_a = q(s_n).argmax(dim=1, keepdim=True)
             max_q_prime = q_target(s_n).gather(1, argmax_a)
             target = r_n + (gamma ** N_STEP) * max_q_prime * done_mask
@@ -245,11 +245,11 @@ def main():
     fastlap = 10000.0
     laptimes = []
 
-    # 💡 [초고속 해금 영역용 정밀 스케줄러 세팅]
-    current_max_speed = 9.0      # 검증이 완료된 안정 지대 시속 10.0m/s부터 4스텝 TD 훈련 스타트
+
+    current_max_speed = 9.0 
     target_top_speed = 20.0      
-    consecutive_success = 0      
-    required_success = 3         # 억까 연속 매칭 스폰 방지를 위해 완화 (2회 연속 완주 시 해금)
+    consecutive_success = 0 
+    required_success = 3 # 연속 3회 이상 완주해야 속도 올리기
 
     for n_epi in range(10000):
         epsilon = max(0.01, 1.0 * (0.998 ** n_epi))
@@ -281,16 +281,15 @@ def main():
             target_steer = (a - 2) * (np.pi / 30)
             steer = (SMOOTHING_ALPHA * target_steer) + ((1.0 - SMOOTHING_ALPHA) * prev_steer)
             
-            # ⚡ [수정] 5개 액션 구조용 초고속 v3 하이브리드 기어비 스케줄링
+            # 기어비 튜닝
             if current_max_speed >= 10.0:
                 if a == 2:
-                    speed = current_max_speed          # 완전 직진 주로: 100% 개방
+                    speed = current_max_speed 
                 elif a == 1 or a == 3:
-                    speed = current_max_speed * 0.88   # 완만 코너: 탄력 극대화 (88% 크루징)
+                    speed = current_max_speed * 0.88  
                 else:
-                    speed = current_max_speed * 0.52   # 하드 코너: 탈출 마진 확보를 위한 하드 감속 (52%)
+                    speed = current_max_speed * 0.52 
             else:
-                # 10m/s 미만 빌드업용 기존 기어 매핑
                 if a == 2:
                     speed = current_max_speed
                 elif a == 1 or a == 3:
@@ -321,14 +320,10 @@ def main():
                     
                     if consecutive_success >= required_success:
                         if current_max_speed < target_top_speed:
-                            # ⚡ [수정] 10.0m/s 이상부터 0.1m/s씩 정밀 승격 메커니즘
+                            # 10.0m/s 이상부터 0.1m/s씩 올리기
                             speed_step = 0.1 if current_max_speed >= 10.0 else 0.2
                             current_max_speed = min(target_top_speed, current_max_speed + speed_step)
                             
-                            # # 🧠 속도 승격 시 굳어버린 탐험률을 일시 복구하여 고속 적응력 극대화
-                            # if current_max_speed >= 10.0:
-                            #     epsilon = max(epsilon, 0.15)
-                                
                         consecutive_success = 0  
                     
                     if fastlap > lap:        
@@ -357,7 +352,6 @@ def eval():
                    map_ext=".png", num_agents=1)
 
     q = Qnet()
-    # 📝 [테스트 가이드] 새롭게 추출한 v3_4step 폴더 안의 검증 가중치를 로드하세요.
     q.load_state_dict(torch.load("26-05-23_ddqn_v3_4step/fast-model_58.01sec_idx247_maxV10.5_epi6097.pt"))
 
     start_idx = 247
@@ -370,7 +364,7 @@ def eval():
     
     poses = np.array([[start_x, start_y, start_theta]])
     
-    # [동기화 매칭] 테스트할 모델 파일에 찍힌 maxV 값을 기입하세요.
+    # 가중치 파일에 적힌 maxV 
     current_eval_max = 10.5
     
     for t in range(5):
@@ -388,7 +382,6 @@ def eval():
             target_steer = (a - 2) * (np.pi / 30)
             steer = (SMOOTHING_ALPHA * target_steer) + ((1.0 - SMOOTHING_ALPHA) * prev_steer)
 
-            # v3 평가 모드 하이브리드 감속 기어 동기화
             if current_eval_max >= 10.0:
                 if a == 2:
                     speed = current_eval_max

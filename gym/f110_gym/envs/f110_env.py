@@ -637,43 +637,8 @@ class F110Env(gym.Env, utils.EzPickle):
         self.collisions = obs_dict['collisions']
 
     def step(self, action):
-        """
-        Step function for the gym env
 
-        Args:
-            action (np.ndarray(num_agents, 2)) -> [steer, speed]
-
-        Returns:
-            obs (dict): observation of the current step
-            reward (float, default=self.timestep): step reward, currently is physics timestep
-            done (bool): if the simulation is done
-            info (dict): auxillary information dictionary
-        """
-        # goals
-        # map_easy1
-        '''goals = [[967, 1198], [1031, 700], [967, 261], [603, 192], [230, 261], [164, 700], [260, 1208], [596, 1253]]
-        for goal in goals:
-            res = 0.007712
-            origin = [-5.275, -1.381]S
-            height = 1420
-            goal[0] = goal[0] * res + origin[0]
-            goal[1] = (height - goal[1]) * res + origin[1]'''
-
-        # map_easy3
-        # waypoint reward -> 안쓰고 있음
-        # goals = [[155, 281], [272, 182], [380, 230], [1361, 1335], [1322, 1365], [1235, 1369], [1184, 1354],
-        #          [293, 1383], [225, 1395], [167, 1357], [137, 1315]]
-        # for goal in goals:
-        #     res = 0.02
-        #     origin = [-2.7, -19.32]
-        #     height = 1646
-        #     # 픽셀 좌표 -> 월드 좌표 변환
-        #     goal[0] = goal[0] * res + origin[0]
-        #     goal[1] = (height - goal[1]) * res + origin[1]
-
-        # call simulation step
-        # 중요! > 여기서 action은 실제 dynamics의 범위로 들어가야 함 -> 모델에서 normalization한 걸 그대로 넣으면 안됨 
-        obs = self.sim.step(action) 
+        obs = self.sim.step(action)
 
         obs['lap_times'] = self.lap_times
         obs['lap_counts'] = self.lap_counts
@@ -681,55 +646,81 @@ class F110Env(gym.Env, utils.EzPickle):
 
         self.current_obs = obs
 
-        # 기본 survival reward (1000 * 0.01 = 10)
-        reward = 1000 * self.timestep
+        # =========================
+        # base reward
+        # =========================
+        reward = 1.0
+        reward += 0.1 * obs['linear_vels_x'][0]
 
-        # JY add : speed
-        reward += 0.05 * obs['linear_vels_x'][0]
+        # =========================
+        # LiDAR reward (center + safety)
+        # =========================
+        scan = np.array(obs['scans'][0])
+        n = len(scan)
 
-        # Lidar 기반 reward
-        if np.argmin(obs['scans'][0]) >= 300 and np.argmin(obs['scans'][0]) <= 780: # 가장 가까운 중앙 방향에 장애물 있는 경우
-            reward -= 1
-        elif np.argmin(obs['scans'][0]) < 300 or np.argmin(obs['scans'][0]) > 780: # 장애물이 옆에 있는 경우
-            reward += 2
-        if min(obs['scans'][0]) < 0.5: # 거리 기반 penalty -> 장애물 너무 가까울 때
-            reward -= 5
-        
-        if self.count < len(globwaypoints):
-            wx, wy = globwaypoints[self.count][:2]
-            X, Y = obs['poses_x'][0], obs['poses_y'][0]
-            dist = np.sqrt(np.power((X - wx), 2) + np.power((Y - wy), 2))
-            #print("Dist:", dist, " to waypoint: ", self.count + 1)
-            if dist > 2:
-                self.count += 1
-                complete = (self.count/len(globwaypoints)) * 0.5
-                #print("Percent complete: ", complete)
-                reward += complete
-        else:
-            self.count = 0
+        left = scan[:n//3]
+        right = scan[-n//3:]
+        front = scan[n//3:-n//3]
 
-        # for i, goal in enumerate(goals):
-        #     if self.checklist[i] == 1:
-        #         continue
-        #     if obs['poses_x'][0] > goal[0] - 0.5 and obs['poses_x'][0] < goal[0] + 0.5 and obs['poses_y'][0] > goal[
-        #         1] - 0.5 and obs['poses_y'][0] < goal[1] + 0.5:
-        #         print('goal pass')
-        #         self.checklist[i] = 1
-        #         reward += 5
+        left_dist = np.mean(left)
+        right_dist = np.mean(right)
+        front_dist = np.min(front)
 
-        self.current_time = self.current_time + self.timestep
+        # center driving
+        center_reward = 1.0 - abs(left_dist - right_dist) / (left_dist + right_dist + 1e-6)
+        reward += 1.2 * center_reward
 
-        # update data member
+        # forward safety
+        # reward += 2.0 * np.clip(front_dist / 3.0, 0, 1)
+
+        if front_dist < 0.5:
+            reward -= 5.0
+
+        # =========================
+        # WAYPOINT (KEY FIX)
+        # =========================
+        X, Y = obs['poses_x'][0], obs['poses_y'][0]
+
+        # 모든 waypoint 거리 계산
+        dists = np.linalg.norm(globwaypoints[:, :2] - np.array([X, Y]), axis=1)
+
+        closest_idx = np.argmin(dists)
+        wx, wy = globwaypoints[closest_idx][:2]
+
+        dist = dists[closest_idx]
+
+        # prev dist 기반 progress reward
+        if self.prev_dist is not None:
+            reward += (self.prev_dist - dist) * 3.0  # 핵심 speed signal
+
+        self.prev_dist = dist
+
+        # waypoint bonus
+        if dist < 1.0:
+            reward += 5.0
+
+        # optional: track index (progress metric only)
+        self.count = closest_idx
+
+        # =========================
+        # time penalty (speed force)
+        # =========================
+        reward -= 0.01
+
+        # =========================
+        # time update
+        # =========================
+        self.current_time += self.timestep
+
         self._update_state(obs)
 
-        # 종료 조건 확인
         done, toggle_list = self._check_done()
         info = {'checkpoint_done': toggle_list}
-        
-        # collision 발생 시 reward 0
+
+        # collision override
         if self.collisions[self.ego_idx]:
             reward = -100
-        # lap 변화 시 
+
         if self.lap_counts[0] != self.pre_lap_counts[0]:
             self.checklist = np.zeros((15))
 
@@ -755,6 +746,10 @@ class F110Env(gym.Env, utils.EzPickle):
         self.near_start = True
         self.near_starts = np.array([True] * self.num_agents)
         self.toggle_list = np.zeros((self.num_agents,))
+
+        # JY add
+        self.count = 0
+        self.prev_dist = None
 
         # states after reset
         self.start_xs = poses[:, 0]
