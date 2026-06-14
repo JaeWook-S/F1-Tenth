@@ -43,7 +43,7 @@ LIDAR_MAX = 30
 VELOCITY_MIN = -5
 VELOCITY_MAX = 20
 
-# 웨이포인트 로드 및 정방향 뒤집기
+# 웨이포인트 로드 및 방향 뒤집기
 csv_path = "{}/maps/Oschersleben_centerline.csv".format(current_dir)
 waypoints = np.genfromtxt(csv_path, delimiter=',') 
 waypoints = np.flip(waypoints, axis=0)
@@ -354,7 +354,7 @@ def eval():
     q = Qnet()
     q.load_state_dict(torch.load("26-05-23_ddqn_v3_4step/fast-model_58.01sec_idx247_maxV10.5_epi6097.pt"))
 
-    start_idx = 247
+    start_idx = 250
     start_x = waypoints[start_idx][0]
     start_y = waypoints[start_idx][1]
     next_idx = (start_idx + 1) % num_waypoints
