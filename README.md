@@ -30,9 +30,7 @@ python -m pkg.main
 Best-performing policy (baseline run)
 
 Run the pretrained best-performing policy:
-```bash
-python3 ./laptime_57.340.py
-```
+
 To train a new model, run:
 ```bash
 python3 ./laptime_57.340.py train
